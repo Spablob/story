@@ -33,7 +33,7 @@ var Fork = upgrades.Fork{
 func GetUpgradeHeight(ctx sdk.Context) (int64, bool) {
 	height, err := netconf.GetUpgradeHeight(ctx.ChainID(), netconf.Horace)
 	if err != nil {
-		log.Error(ctx, "Failed to get upgrade height", err, "chain_id", ctx.ChainID(), "upgrade_name", netconf.Horace)
+		log.Error(ctx, "Failed to get upgrade height", err, "chain_id", ctx.ChainID(), "upgrade_name", netconf.Terence)
 
 		return 0, false
 	}

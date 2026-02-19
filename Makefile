@@ -55,10 +55,6 @@ secrets-baseline: ensure-detect-secrets ## Update secrets baseline.
 fix-golden: ## Fixes golden test fixtures.
 	@./scripts/fix_golden_tests.sh
 
-.PHONY: mockgen
-mockgen: ## Generates mock files.
-	@cd scripts && bash mockgen.sh
-
 ###############################################################################
 ###                                Testing                                 	###
 ###############################################################################
