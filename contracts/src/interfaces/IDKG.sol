@@ -1,41 +1,94 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.23;
+// SPDX-License-Identifier: GPL-3.0-only
+pragma solidity 0.8.23;
 
-contract IDKG {
-    enum ChallengeStatus {
-        NotChallenged,
-        Invalidated,
-        Resolved
+interface IDKG {
+    /// @notice Struct for the enclave type data unique to each enclave type
+    /// @param codeCommitment The code commitment
+    /// @param validationHookAddr The address of the validation hook
+    struct EnclaveTypeData {
+        bytes32 codeCommitment;
+        address validationHookAddr;
     }
 
-    enum NodeStatus {
-        Unregistered,
-        Registered,
-        Finalized
-    }
-
-    struct NodeInfo {
+    /// @notice Struct for the enclave instance data unique to each instance
+    /// @param round The round
+    /// @param validatorAddr The address of the validator
+    /// @param enclaveType The type of the enclave
+    /// @param enclaveCommKey The communication key of the enclave
+    /// @param dkgPubKey The DKG public key
+    struct EnclaveInstanceData {
+        uint32 round;
+        address validatorAddr;
+        bytes32 enclaveType;
+        bytes enclaveCommKey;
         bytes dkgPubKey;
-        bytes commPubKey;
-        bytes rawQuote;
-        ChallengeStatus chalStatus;
-        NodeStatus nodeStatus;
     }
 
-    event DKGInitialized(
-        address indexed msgSender,
+    /// @notice Emitted when the minimum required registered participants is set
+    /// @param newMinReqRegisteredParticipants The new minimum required registered participants
+    event MinReqRegisteredParticipantsSet(uint256 newMinReqRegisteredParticipants);
+
+    /// @notice Emitted when the minimum required finalized participants is set
+    /// @param newMinReqFinalizedParticipants The new minimum required finalized participants
+    event MinReqFinalizedParticipantsSet(uint256 newMinReqFinalizedParticipants);
+
+    /// @notice Emitted when the operational threshold is set
+    /// @param newOperationalThreshold The new operational threshold
+    event OperationalThresholdSet(uint256 newOperationalThreshold);
+
+    /// @notice Emitted when the fee is set
+    /// @param newFee The new fee
+    event FeeSet(uint256 newFee);
+
+    /// @notice Emitted when an enclave type is whitelisted
+    /// @param enclaveType The type of the enclave
+    /// @param codeCommitment The code commitment
+    /// @param validationHookAddr The address of the validation hook
+    /// @param isWhitelisted Whether the enclave type is whitelisted
+    event EnclaveTypeWhitelisted(
+        bytes32 enclaveType,
         bytes32 codeCommitment,
-        uint32 round,
-        uint64 startBlockHeight,
-        bytes32 startBlockHash,
-        bytes dkgPubKey,
-        bytes commPubKey,
-        bytes rawQuote
+        address validationHookAddr,
+        bool isWhitelisted
     );
 
-    event DKGFinalized(
-        address indexed msgSender,
+    /// @notice Emitted when an enclave instance is registered
+    /// @param enclaveReport The enclave report
+    /// @param round The round
+    /// @param validatorAddr The address of the validator
+    /// @param enclaveType The type of the enclave
+    /// @param enclaveCommKey The communication key of the enclave
+    /// @param dkgPubKey The DKG public key
+    /// @param codeCommitment The code commitment
+    /// @param startBlockHeight The start block height
+    /// @param startBlockHash The start block hash
+    /// @param validationContext The validation context
+    event Registered(
+        bytes enclaveReport,
         uint32 round,
+        address indexed validatorAddr,
+        bytes32 enclaveType,
+        bytes enclaveCommKey,
+        bytes dkgPubKey,
+        bytes32 codeCommitment,
+        uint256 startBlockHeight,
+        bytes32 startBlockHash,
+        bytes validationContext
+    );
+
+    /// @notice Emitted when an enclave instance is finalized
+    /// @param round The round
+    /// @param validatorAddr The address of the validator
+    /// @param enclaveType The type of the enclave
+    /// @param codeCommitment The code commitment
+    /// @param participantsRoot The participants root
+    /// @param globalPubKey The global public key
+    /// @param publicCoeffs The public coefficients
+    /// @param signature The signature
+    event Finalized(
+        uint32 round,
+        address indexed validatorAddr,
+        bytes32 enclaveType,
         bytes32 codeCommitment,
         bytes32 participantsRoot,
         bytes globalPubKey,
@@ -43,52 +96,95 @@ contract IDKG {
         bytes signature
     );
 
-    event UpgradeScheduled(uint32 activationHeight, bytes32 codeCommitment);
+    /// @notice Sets the minimum number of participants needed to be registered for each round
+    /// @param newMinReqRegisteredParticipants The minimum number of participants needed to be registered for each round
+    function setMinReqRegisteredParticipants(uint256 newMinReqRegisteredParticipants) external;
 
-    event RemoteAttestationProcessedOnChain(
-        address validator,
-        ChallengeStatus chalStatus,
+    /// @notice Sets the minimum number of participants needed to finish dkg for each round
+    /// @param newMinReqFinalizedParticipants The minimum number of participants needed to finish dkg for each round
+    function setMinReqFinalizedParticipants(uint256 newMinReqFinalizedParticipants) external;
+
+    /// @notice Sets the operational threshold
+    /// @param newOperationalThreshold The operational threshold
+    function setOperationalThreshold(uint256 newOperationalThreshold) external;
+
+    /// @notice Sets the fee paid to request DKG registration (register and finalize)
+    /// @param newFee The fee paid to request DKG registration (register and finalize)
+    function setFee(uint256 newFee) external;
+
+    /// @notice Whitelists an enclave type
+    /// @param enclaveType The type of the enclave
+    /// @param enclaveTypeData The data of the enclave type
+    /// @param isWhitelisted Whether the enclave type is whitelisted
+    function whitelistEnclaveType(
+        bytes32 enclaveType,
+        EnclaveTypeData memory enclaveTypeData,
+        bool isWhitelisted
+    ) external;
+
+    /// @notice Authenticates an enclave report
+    /// @param enclaveReport The enclave report
+    /// @param enclaveInstanceData The data of the enclave instance
+    /// @param validationContext The validation context
+    function authenticateEnclaveReport(
+        bytes calldata enclaveReport,
+        EnclaveInstanceData calldata enclaveInstanceData,
+        bytes calldata validationContext
+    ) external payable;
+
+    /// @notice Registers an enclave instance
+    /// @param enclaveReport The enclave report
+    /// @param enclaveInstanceData The data of the enclave instance
+    /// @param startBlockHeight The start block height
+    /// @param startBlockHash The start block hash
+    /// @param validationContext The validation context
+    function register(
+        bytes calldata enclaveReport,
+        EnclaveInstanceData calldata enclaveInstanceData,
+        uint256 startBlockHeight,
+        bytes32 startBlockHash,
+        bytes calldata validationContext
+    ) external payable;
+
+    /// @notice Finalizes an enclave instance
+    /// @param round The round
+    /// @param validatorAddr The address of the validator
+    /// @param enclaveType The type of the enclave
+    /// @param participantsRoot The participants root
+    /// @param globalPubKey The global public key
+    /// @param publicCoeffs The public coefficients
+    /// @param signature The signature
+    function finalize(
         uint32 round,
-        bytes32 codeCommitment
-    );
+        address validatorAddr,
+        bytes32 enclaveType,
+        bytes32 participantsRoot,
+        bytes calldata globalPubKey,
+        bytes[] calldata publicCoeffs,
+        bytes calldata signature
+    ) external payable;
 
-    // TODO: remove index and use validator address instead
-    event DealComplaintsSubmitted(uint32 index, uint32[] complainIndexes, uint32 round, bytes32 codeCommitment);
+    /// @notice Gets the minimum number of participants needed to be registered for each round
+    /// @return The minimum number of participants needed to be registered for each round
+    function minReqRegisteredParticipants() external view returns (uint256);
 
-    event DealVerified(uint32 index, uint32 recipientIndex, uint32 round, bytes32 codeCommitment);
+    /// @notice Gets the minimum number of participants needed to finish dkg for each round
+    /// @return The minimum number of participants needed to finish dkg for each round
+    function minReqFinalizedParticipants() external view returns (uint256);
 
-    event InvalidDeal(uint32 index, uint32 round, bytes32 codeCommitment);
+    /// @notice Gets the operational threshold
+    /// @return The operational threshold
+    function operationalThreshold() external view returns (uint256);
 
-    // Emitted when a client requests TDH2 threshold decryption for a ciphertext/label pair.
-    // @param requesterPubKey: secp256k1 uncompressed requester pubkey (65 bytes)
-    event ThresholdDecryptRequested(
-        address indexed requester,
-        uint32 round,
-        bytes32 codeCommitment,
-        bytes requesterPubKey,
-        bytes ciphertext,
-        bytes label
-    );
+    /// @notice Gets the fee paid to request DKG registration (register and finalize)
+    /// @return The fee paid to request DKG registration (register and finalize)
+    function fee() external view returns (uint256);
 
-    // Emitted when a validator submits a TDH2 partial decryption.
-    // @param pid: party ID, 1-based index from DKG registration (used in Kyber polynomial evaluation)
-    event PartialDecryptionSubmitted(
-        address indexed validator,
-        uint32 round,
-        bytes32 codeCommitment,
-        uint32 pid,
-        bytes encryptedPartial,
-        bytes ephemeralPubKey,
-        bytes pubShare,
-        bytes label
-    );
+    /// @notice Gets the enclave type data
+    /// @param enclaveType The type of the enclave
+    function enclaveTypeData(bytes32 enclaveType) external view returns (EnclaveTypeData memory);
 
-    // TDH2 partial decrypt submissions keyed by (codeCommitment, round, labelHash, pid).
-    struct PartialDecryptSubmission {
-        address validator;
-        bytes partialDecryption;
-        bytes pubShare;
-        bytes label;
-        bool exists;
-    }
+    /// @notice Gets the is enclave type whitelisted
+    /// @param enclaveType The type of the enclave
+    function isEnclaveTypeWhitelisted(bytes32 enclaveType) external view returns (bool);
 }

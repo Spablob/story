@@ -1,253 +1,325 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.23;
+// SPDX-License-Identifier: GPL-3.0-only
+pragma solidity 0.8.23;
 
+import { PausableUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import { Ownable2StepUpgradeable } from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
+import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import { IDKG } from "../interfaces/IDKG.sol";
-import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import { IAttestationReportValidator } from "../interfaces/IAttestationReportValidator.sol";
 
-/**
- * @title DKG - Distributed Key Generation Contract
- * @dev Core contract for managing DKG-related state and operations
- */
-contract DKG is IDKG {
-    uint32 constant UINT32_MAX = type(uint32).max;
-
-    bytes32 public curCodeCommitment;
-
-    mapping(bytes32 codeCommitment => mapping(uint32 round => mapping(address validator => NodeInfo))) public dkgNodeInfos;
-    mapping(bytes32 codeCommitment => mapping(uint32 round => mapping(uint32 index => mapping(address complainant => bool))))
-        public dealComplaints;
-
-    mapping(bytes32 codeCommitment => mapping(uint32 round => mapping(bytes32 labelHash => mapping(uint32 pid => PartialDecryptSubmission))))
-        public partialDecrypts;
-
-    constructor(bytes32 codeCommitment) {
-        curCodeCommitment = codeCommitment;
+contract DKG is IDKG, Ownable2StepUpgradeable, PausableUpgradeable, UUPSUpgradeable {
+    /// @dev Storage structure for the DKG
+    /// @param minReqRegisteredParticipants The minimum number of participants needed to be registered for each round
+    /// @param minReqFinalizedParticipants The minimum number of participants needed to finish dkg for each round
+    /// @param operationalThreshold The operational threshold
+    /// @param fee The fee paid to request DKG registration (register and finalize)
+    /// @param enclaveTypeData The data of the enclave type
+    /// @param isEnclaveTypeWhitelisted The whitelist of enclave types
+    /// @custom:storage-location erc7201:story.DKG
+    struct DKGStorage {
+        uint256 minReqRegisteredParticipants;
+        uint256 minReqFinalizedParticipants;
+        uint256 operationalThreshold;
+        uint256 fee;
+        mapping(bytes32 enclaveType => EnclaveTypeData enclaveTypeData) enclaveTypeData;
+        mapping(bytes32 enclaveType => bool isWhitelisted) isEnclaveTypeWhitelisted;
     }
 
-    modifier onlyValidCodeCommitment(bytes32 codeCommitment) {
-        require(
-            keccak256(abi.encodePacked(codeCommitment)) == keccak256(abi.encodePacked(curCodeCommitment)),
-            "Invalid code commitment"
-        );
+    // basis point for the operational threshold
+    uint256 public constant operationalThresholdBasis = 1000;
+
+    // keccak256(abi.encode(uint256(keccak256("story.DKG")) - 1)) & ~bytes32(uint256(0xff));
+    bytes32 private constant DKGStorageLocation = 0x12adbc8310743862abf90938062c5fa55b79e1f01d48ab009dbc12b76d617f00;
+
+    modifier chargesFee() {
+        require(msg.value == _getDKGStorage().fee, "DKG: Invalid fee amount");
+        payable(address(0x0)).transfer(msg.value);
         _;
     }
 
-    function initializeDKG(
-        uint32 round,
-        bytes32 codeCommitment,
-        uint64 startBlockHeight,
-        bytes32 startBlockHash,
-        bytes calldata dkgPubKey,
-        bytes calldata commPubKey,
-        bytes calldata rawQuote
-    ) external onlyValidCodeCommitment(codeCommitment) {
-        require(
-            _verifyRemoteAttestation(rawQuote, msg.sender, round, startBlockHeight, startBlockHash, dkgPubKey, commPubKey),
-            "Invalid remote attestation"
-        );
-
-        dkgNodeInfos[codeCommitment][round][msg.sender] = NodeInfo({
-            dkgPubKey: dkgPubKey,
-            commPubKey: commPubKey,
-            rawQuote: rawQuote,
-            chalStatus: ChallengeStatus.NotChallenged,
-            nodeStatus: NodeStatus.Registered
-        });
-
-        emit DKGInitialized(msg.sender, codeCommitment, round, startBlockHeight, startBlockHash, dkgPubKey, commPubKey, rawQuote);
+    constructor() {
+        _disableInitializers();
     }
 
-    function finalizeDKG(
+    /// @notice Initializes the contract
+    /// @param owner The address of the owner of the contract
+    /// @param minReqRegisteredParticipants The minimum number of participants needed to be registered for each round
+    /// @param minReqFinalizedParticipants The minimum number of participants needed to finish dkg for each round
+    /// @param operationalThreshold The operational threshold
+    /// @param fee The fee to pay for operations
+    function initialize(
+        address owner,
+        uint256 minReqRegisteredParticipants,
+        uint256 minReqFinalizedParticipants,
+        uint256 operationalThreshold,
+        uint256 fee
+    ) external initializer {
+        __Ownable_init(owner);
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        _setMinReqRegisteredParticipants(minReqRegisteredParticipants);
+        _setMinReqFinalizedParticipants(minReqFinalizedParticipants);
+        _setOperationalThreshold(operationalThreshold);
+        _setFee(fee);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+    //                             Admin Setters                              //
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Sets the minimum number of participants needed to be registered for each round
+    /// @param newMinReqRegisteredParticipants The minimum number of participants needed to be registered for each round
+    function setMinReqRegisteredParticipants(uint256 newMinReqRegisteredParticipants) external onlyOwner {
+        _setMinReqRegisteredParticipants(newMinReqRegisteredParticipants);
+    }
+
+    /// @notice Sets the minimum number of participants needed to finish dkg for each round
+    /// @param newMinReqFinalizedParticipants The minimum number of participants needed to finish dkg for each round
+    function setMinReqFinalizedParticipants(uint256 newMinReqFinalizedParticipants) external onlyOwner {
+        _setMinReqFinalizedParticipants(newMinReqFinalizedParticipants);
+    }
+
+    /// @notice Sets the operational threshold
+    /// @param newOperationalThreshold The operational threshold
+    function setOperationalThreshold(uint256 newOperationalThreshold) external onlyOwner {
+        _setOperationalThreshold(newOperationalThreshold);
+    }
+
+    /// @notice Sets the fee paid to request DKG registration (register and finalize)
+    /// @param newFee The fee paid to request DKG registration (register and finalize)
+    function setFee(uint256 newFee) external onlyOwner {
+        _setFee(newFee);
+    }
+
+    /// @notice Whitelists an enclave type
+    /// @param enclaveType The type of the enclave
+    /// @param enclaveTypeData The data of the enclave type
+    /// @param isWhitelisted Whether the enclave type is whitelisted
+    function whitelistEnclaveType(
+        bytes32 enclaveType,
+        EnclaveTypeData memory enclaveTypeData,
+        bool isWhitelisted
+    ) external onlyOwner {
+        require(enclaveType != bytes32(0), "DKG: Enclave type cannot be empty");
+        require(enclaveTypeData.codeCommitment != bytes32(0), "DKG: Code commitment cannot be empty");
+        require(enclaveTypeData.validationHookAddr != address(0), "DKG: Validation hook cannot be empty");
+        DKGStorage storage $ = _getDKGStorage();
+
+        $.enclaveTypeData[enclaveType] = enclaveTypeData;
+        $.isEnclaveTypeWhitelisted[enclaveType] = isWhitelisted;
+
+        emit EnclaveTypeWhitelisted(
+            enclaveType,
+            enclaveTypeData.codeCommitment,
+            enclaveTypeData.validationHookAddr,
+            isWhitelisted
+        );
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+    //                           Authentication Logic                         //
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Authenticates an enclave
+    /// @param enclaveReport The enclave report
+    /// @param enclaveInstanceData The data of the enclave instance
+    /// @param validationContext The validation context
+    function authenticateEnclaveReport(
+        bytes calldata enclaveReport,
+        EnclaveInstanceData calldata enclaveInstanceData,
+        bytes calldata validationContext
+    ) external payable chargesFee whenNotPaused {
+        _authenticateEnclaveReport(enclaveReport, enclaveInstanceData, validationContext);
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+    //                              CL Operations                             //
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Registers an enclave instance
+    /// @param enclaveReport The enclave report
+    /// @param enclaveInstanceData The data of the enclave instance
+    /// @param startBlockHeight The start block height
+    /// @param startBlockHash The start block hash
+    /// @param validationContext The validation context
+    function register(
+        bytes calldata enclaveReport,
+        EnclaveInstanceData calldata enclaveInstanceData,
+        uint256 startBlockHeight,
+        bytes32 startBlockHash,
+        bytes calldata validationContext
+    ) external payable chargesFee whenNotPaused {
+        require(enclaveReport.length != 0, "DKG: Enclave report cannot be empty");
+        require(enclaveInstanceData.round != 0, "DKG: Round cannot be zero");
+        require(enclaveInstanceData.validatorAddr != address(0), "DKG: Validator address cannot be empty");
+        require(enclaveInstanceData.enclaveType != bytes32(0), "DKG: Enclave type cannot be empty");
+        require(enclaveInstanceData.enclaveCommKey.length != 0, "DKG: Enclave communication key cannot be empty");
+        require(enclaveInstanceData.dkgPubKey.length != 0, "DKG: DKG public key cannot be empty");
+
+        _authenticateEnclaveReport(enclaveReport, enclaveInstanceData, validationContext);
+
+        emit Registered(
+            enclaveReport,
+            enclaveInstanceData.round,
+            enclaveInstanceData.validatorAddr,
+            enclaveInstanceData.enclaveType,
+            enclaveInstanceData.enclaveCommKey,
+            enclaveInstanceData.dkgPubKey,
+            _getDKGStorage().enclaveTypeData[enclaveInstanceData.enclaveType].codeCommitment,
+            startBlockHeight,
+            startBlockHash,
+            validationContext
+        );
+    }
+
+    /// @notice Finalizes an enclave instance
+    /// @param round The round
+    /// @param validatorAddr The address of the validator
+    /// @param enclaveType The type of the enclave
+    /// @param participantsRoot The participants root
+    /// @param globalPubKey The global public key
+    /// @param publicCoeffs The public coefficients
+    /// @param signature The signature
+    function finalize(
         uint32 round,
-        bytes32 codeCommitment,
+        address validatorAddr,
+        bytes32 enclaveType,
         bytes32 participantsRoot,
         bytes calldata globalPubKey,
         bytes[] calldata publicCoeffs,
         bytes calldata signature
-    ) external onlyValidCodeCommitment(codeCommitment) {
-        NodeInfo storage node = dkgNodeInfos[codeCommitment][round][msg.sender];
+    ) external payable chargesFee whenNotPaused {
+        DKGStorage storage $ = _getDKGStorage();
+        require(round != 0, "DKG: Round cannot be zero");
+        require(validatorAddr != address(0), "DKG: Validator address cannot be empty");
+        require($.isEnclaveTypeWhitelisted[enclaveType], "DKG: Enclave type is not whitelisted");
+        require(participantsRoot != bytes32(0), "DKG: Participants root cannot be empty");
+        require(globalPubKey.length != 0, "DKG: Global public key cannot be empty");
+        require(publicCoeffs.length != 0, "DKG: Public coefficients cannot be empty");
+        require(signature.length != 0, "DKG: Signature cannot be empty");
 
-        require(node.chalStatus != ChallengeStatus.Invalidated, "Node was invalidated");
-        require(
-            _verifyFinalizationSignature(
-                node.commPubKey,
-                round,
-                codeCommitment,
-                participantsRoot,
-                globalPubKey,
-                publicCoeffs,
-                signature
-            ),
-            "Invalid finalization signature"
-        );
-
-        node.nodeStatus = NodeStatus.Finalized;
-
-        emit DKGFinalized(msg.sender, round, codeCommitment, participantsRoot, globalPubKey, publicCoeffs, signature);
-    }
-
-    function complainDeals(
-        uint32 round,
-        uint32 index,
-        uint32[] memory complainIndexes,
-        bytes32 codeCommitment
-    ) external onlyValidCodeCommitment(codeCommitment) {
-        NodeInfo storage complainant = dkgNodeInfos[codeCommitment][round][msg.sender];
-
-        for (uint256 i = 0; i < complainIndexes.length; i++) {
-            dealComplaints[codeCommitment][round][complainIndexes[i]][msg.sender] = true;
-        }
-
-        emit DealComplaintsSubmitted(index, complainIndexes, round, codeCommitment);
-    }
-
-    /// @dev Emit a TDH2 threshold decryption request so validators can fetch ciphertext+label.
-    /// TODO: some fee should flow into the contract to prevent abuse and incentivize DKG validators.
-    function requestThresholdDecryption(
-        uint32 round,
-        bytes32 codeCommitment,
-        bytes calldata requesterPubKey,
-        bytes calldata ciphertext,
-        bytes calldata label
-    ) external onlyValidCodeCommitment(codeCommitment) {
-        require(round > 0, "Invalid round");
-        require(ciphertext.length > 0, "Empty ciphertext");
-        require(requesterPubKey.length == 65, "Invalid requester pubkey"); // secp256k1 uncompressed
-        emit ThresholdDecryptRequested(msg.sender, round, codeCommitment, requesterPubKey, ciphertext, label);
-    }
-
-    /// @dev Submit a TDH2 partial decryption for a given round/codeCommitment/label.
-    /// TODO: only allow certain contracts to call this function so only IP holder can request decryption.
-    function submitPartialDecryption(
-        uint32 round,
-        bytes32 codeCommitment,
-        uint32 pid,
-        bytes calldata encryptedPartial,
-        bytes calldata ephemeralPubKey,
-        bytes calldata pubShare,
-        bytes calldata label
-    ) external onlyValidCodeCommitment(codeCommitment) {
-        require(round > 0, "Invalid round");
-        require(pid > 0, "Invalid pid");
-        require(encryptedPartial.length > 0, "Empty partial");
-        require(pubShare.length > 0, "Empty pubShare");
-        require(label.length > 0, "Empty label");
-        require(ephemeralPubKey.length == 65, "Invalid ephemeral pubkey"); // secp256k1 uncompressed
-
-        bytes32 labelHash = keccak256(label);
-        PartialDecryptSubmission storage existing = partialDecrypts[codeCommitment][round][labelHash][pid];
-        require(!existing.exists, "Partial already submitted");
-
-        partialDecrypts[codeCommitment][round][labelHash][pid] = PartialDecryptSubmission({
-            validator: msg.sender,
-            partialDecryption: encryptedPartial,
-            pubShare: pubShare,
-            label: label,
-            exists: true
-        });
-
-        emit PartialDecryptionSubmitted(
-            msg.sender,
+        emit Finalized(
             round,
-            codeCommitment,
-            pid,
-            encryptedPartial,
-            ephemeralPubKey,
-            pubShare,
-            label
+            validatorAddr,
+            enclaveType,
+            $.enclaveTypeData[enclaveType].codeCommitment,
+            participantsRoot,
+            globalPubKey,
+            publicCoeffs,
+            signature
         );
     }
 
-    //////////////////////////////////////////////////////////////
-    //                      Getter Functions                    //
-    //////////////////////////////////////////////////////////////
+    /*//////////////////////////////////////////////////////////////////////////
+    //                              Get Functions                             //
+    //////////////////////////////////////////////////////////////////////////*/
 
-    function getNodeInfo(bytes32 codeCommitment, uint32 round, address validator) external view returns (NodeInfo memory) {
-        return dkgNodeInfos[codeCommitment][round][validator];
+    /// @notice Gets the minimum number of participants needed to be registered for each round
+    /// @return The minimum number of participants needed to be registered for each round
+    function minReqRegisteredParticipants() external view returns (uint256) {
+        return _getDKGStorage().minReqRegisteredParticipants;
     }
 
-    //////////////////////////////////////////////////////////////
-    //                      Internal Functions                  //
-    //////////////////////////////////////////////////////////////
-
-    function _verifyFinalizationSignature(
-        bytes memory commPubKey,
-        uint32 round,
-        bytes32 codeCommitment,
-        bytes32 participantsRoot,
-        bytes calldata globalPubKey,
-        bytes[] calldata publicCoeffs,
-        bytes calldata signature
-    ) internal pure returns (bool) {
-        bytes memory encoded = abi.encodePacked(codeCommitment, round, participantsRoot, globalPubKey);
-
-        for (uint256 i = 0; i < publicCoeffs.length; i++) {
-            encoded = bytes.concat(encoded, publicCoeffs[i]);
-        }
-
-        bytes32 msgHash = keccak256(encoded);
-        address signer = ECDSA.recover(MessageHashUtils.toEthSignedMessageHash(msgHash), signature);
-        return signer == address(uint160(uint256(keccak256(commPubKey))));
+    /// @notice Gets the minimum number of participants needed to finish dkg for each round
+    /// @return The minimum number of participants needed to finish dkg for each round
+    function minReqFinalizedParticipants() external view returns (uint256) {
+        return _getDKGStorage().minReqFinalizedParticipants;
     }
 
-    function _verifyRemoteAttestation(
-        bytes memory rawQuote,
-        address validator,
-        uint32 round,
-        uint64 startBlockHeight,
-        bytes32 startBlockHash,
-        bytes memory dkgPubKey,
-        bytes memory commPubKey
-    ) internal pure returns (bool) {
-        // TODO: on chain DCAP verification
-        require(rawQuote.length > 64, "Invalid raw quote, quote too short");
-        require(validator != address(0), "Invalid validator address");
-        require(round > 0, "Invalid round of DKG");
-        require(dkgPubKey.length > 0, "Invalid DKG public key");
-        require(commPubKey.length > 0, "Invalid communication public key");
-        require(startBlockHeight > 0, "Invalid start block height");
-        require(startBlockHash != bytes32(0), "Invalid start block hash");
-
-        bytes32 expectedReportData = _extractReportData(rawQuote);
-        return _validateReportData(validator, round, startBlockHeight, startBlockHash, dkgPubKey, commPubKey, expectedReportData);
+    /// @notice Gets the operational threshold
+    /// @return The operational threshold
+    function operationalThreshold() external view returns (uint256) {
+        return _getDKGStorage().operationalThreshold;
     }
 
-    function _extractReportData(bytes memory rawQuote) internal pure returns (bytes32) {
-        // According to Intel’s SGX quote structure:
-        // - The SGX quote header is 48 bytes in size
-        // - The enclave report body is 384 bytes long
-        // - The last 64 bytes of the enclave report body are reserved for report_data
-        // Therefore, the starting offset for report_data is: 48 (quote header) + 320 = 368
-        // https://github.com/intel/SGX-TDX-DCAP-QuoteVerificationLibrary/blob/16b7291a7a86e486fdfcf1dfb4be885c0cc00b4e/Src/AttestationLibrary/src/QuoteVerification/QuoteConstants.h
-        uint256 start = 368;
-        bytes32 first32;
+    /// @notice Gets the fee paid to request DKG registration (register and finalize)
+    /// @return The fee paid to request DKG registration (register and finalize)
+    function fee() external view returns (uint256) {
+        return _getDKGStorage().fee;
+    }
+
+    /// @notice Gets the enclave type data
+    /// @param enclaveType The type of the enclave
+    function enclaveTypeData(bytes32 enclaveType) external view returns (EnclaveTypeData memory) {
+        return _getDKGStorage().enclaveTypeData[enclaveType];
+    }
+
+    /// @notice Gets the is enclave type whitelisted
+    /// @param enclaveType The type of the enclave
+    function isEnclaveTypeWhitelisted(bytes32 enclaveType) external view returns (bool) {
+        return _getDKGStorage().isEnclaveTypeWhitelisted[enclaveType];
+    }
+
+    /*//////////////////////////////////////////////////////////////////////////
+    //                           Internal Functions                           //
+    //////////////////////////////////////////////////////////////////////////*/
+
+    /// @notice Sets the minimum number of participants needed to be registered for each round
+    /// @param newMinReqRegisteredParticipants The minimum number of participants needed to be registered for each round
+    function _setMinReqRegisteredParticipants(uint256 newMinReqRegisteredParticipants) internal {
+        require(newMinReqRegisteredParticipants > 0, "DKG: MinReqRegisteredParticipants cannot be zero");
+        _getDKGStorage().minReqRegisteredParticipants = newMinReqRegisteredParticipants;
+        emit MinReqRegisteredParticipantsSet(newMinReqRegisteredParticipants);
+    }
+
+    /// @notice Sets the minimum number of participants needed to finish dkg for each round
+    /// @param newMinReqFinalizedParticipants The minimum number of participants needed to finish dkg for each round
+    function _setMinReqFinalizedParticipants(uint256 newMinReqFinalizedParticipants) internal {
+        require(newMinReqFinalizedParticipants > 0, "DKG: MinReqFinalizedParticipants cannot be zero");
+        _getDKGStorage().minReqFinalizedParticipants = newMinReqFinalizedParticipants;
+        emit MinReqFinalizedParticipantsSet(newMinReqFinalizedParticipants);
+    }
+
+    /// @notice Sets the operational threshold
+    /// @param newOperationalThreshold The operational threshold
+    function _setOperationalThreshold(uint256 newOperationalThreshold) internal {
+        require(newOperationalThreshold > 0, "DKG: Operational threshold cannot be zero");
+        require(
+            newOperationalThreshold <= operationalThresholdBasis,
+            "DKG: Operational threshold cannot be greater than 1000"
+        );
+        _getDKGStorage().operationalThreshold = newOperationalThreshold;
+        emit OperationalThresholdSet(newOperationalThreshold);
+    }
+
+    /// @notice Sets the fee paid to request DKG registration (register and finalize)
+    /// @param newFee The fee paid to request DKG registration (register and finalize)
+    function _setFee(uint256 newFee) internal {
+        _getDKGStorage().fee = newFee;
+        emit FeeSet(newFee);
+    }
+
+    /// @dev Authenticates an enclave report
+    /// @param enclaveReport The enclave report
+    /// @param enclaveInstanceData The data of the enclave instance
+    /// @param validationContext The validation context
+    function _authenticateEnclaveReport(
+        bytes calldata enclaveReport,
+        EnclaveInstanceData calldata enclaveInstanceData,
+        bytes calldata validationContext
+    ) internal {
+        DKGStorage storage $ = _getDKGStorage();
+        EnclaveTypeData memory enclaveTypeData = $.enclaveTypeData[enclaveInstanceData.enclaveType];
+        require($.isEnclaveTypeWhitelisted[enclaveInstanceData.enclaveType], "DKG: Enclave type is not whitelisted");
+
+        bool isValidReport = IAttestationReportValidator(enclaveTypeData.validationHookAddr).validateReport(
+            enclaveTypeData.codeCommitment,
+            keccak256(abi.encode(enclaveInstanceData)),
+            enclaveReport,
+            validationContext
+        );
+        require(isValidReport, "DKG: Enclave authentication failed");
+    }
+
+    /// @dev Hook to authorize the upgrade according to UUPSUpgradeable
+    /// @param newImplementation The address of the new implementation
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    /// @dev Returns the storage struct of DKG.
+    function _getDKGStorage() private pure returns (DKGStorage storage $) {
         assembly {
-            first32 := mload(add(add(rawQuote, 32), start))
+            $.slot := DKGStorageLocation
         }
-        return first32;
-    }
-
-    function _validateReportData(
-        address validator,
-        uint32 round,
-        uint64 startBlockHeight,
-        bytes32 startBlockHash,
-        bytes memory dkgPubKey,
-        bytes memory commPubKey,
-        bytes32 expectedReportData
-    ) internal pure returns (bool) {
-        bytes32 reportData = keccak256(
-            abi.encodePacked(
-                validator,
-                round,
-                startBlockHeight,
-                startBlockHash,
-                dkgPubKey,
-                commPubKey
-            )
-        );
-        
-        return reportData == expectedReportData;
     }
 }

@@ -339,13 +339,23 @@ contract GenerateAlloc is Script {
     }
 
     function setDKG() internal {
-        // temp value of codeCommitment
-        bytes32 initialCodeCommitment = hex"4d53ef0428afd0bc343e4c0ca19efd05ad5d5747b4b230491c5e1237ca294739";
-
         address impl = Predeploys.getImplAddress(Predeploys.DKG);
-        address tmp = address(new DKG(initialCodeCommitment)); // initial code commitment
+        address tmp = address(new DKG());
         vm.etch(impl, tmp.code);
-        vm.store(Predeploys.DKG, bytes32(uint256(0)), initialCodeCommitment);
+
+        InitializableHelper.disableInitializers(impl);
+
+        uint256 minReqRegisteredParticipants = 3;
+        uint256 minReqFinalizedParticipants = 3;
+        uint256 operationalThreshold = 670; // 67%
+        uint256 fee = 1 ether; // 1 IP
+        DKG(Predeploys.DKG).initialize(
+            timelock,
+            minReqRegisteredParticipants,
+            minReqFinalizedParticipants,
+            operationalThreshold,
+            fee
+        );
 
         // reset tmp
         vm.etch(tmp, "");
